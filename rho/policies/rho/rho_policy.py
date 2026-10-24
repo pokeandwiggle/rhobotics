@@ -364,15 +364,23 @@ class RhoPolicy(PreTrainedPolicy):
         return self._queues["action"].popleft()
 
     @torch.no_grad()
-    def sample_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def sample_actions(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, prefix: Tensor | None = None
+    ) -> Tensor:
+        """Sample a chunk. ``prefix`` is (B, rtc_delay, action_dim) normalized committed actions
+        for a train-time-RTC checkpoint, zero-padded here to the model's width like training's
+        actions; it is pinned clean and returned verbatim as the first steps."""
         self.eval()
         inputs = self._prepare_model_inputs(batch)
+        if prefix is not None:
+            prefix = self.pad_vector(prefix, self.config.max_action_dim)
         actions = self.model.sample_actions(
             inputs.image,
             inputs.prompt,
             inputs.state,
             noise=noise,
             image_mask=inputs.image_mask,
+            prefix=prefix,
         )
 
         original_action_dim = self.config.action_feature.shape[0]
