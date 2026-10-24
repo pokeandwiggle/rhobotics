@@ -68,6 +68,10 @@ class RhoConfig(PolicyConfig):
     scheduler_decay_lr: float = 2.5e-6
     time_sampling_strategy: str = "beta"
     dropout_p: float = 0.02
+    # Train-time RTC (arXiv 2512.05964). None trains and samples as plain flow matching. A delay d
+    # trains each example on a clean d-step action prefix 25% of the time (else none), enabling
+    # ``sample_actions(prefix=...)`` for exactly d steps.
+    rtc_delay: int | None = None
     pos_emb_method: str = "sinusoidal"
     log_hidden_state_stats: bool = True
 
@@ -103,6 +107,8 @@ class RhoConfig(PolicyConfig):
             raise ValueError("num_flow_samples must be at least 1")
         if not 0.0 <= self.dropout_p <= 1.0:
             raise ValueError("dropout_p must be between 0.0 and 1.0")
+        if self.rtc_delay is not None and not 0 < self.rtc_delay < self.chunk_size:
+            raise ValueError(f"rtc_delay must satisfy 0 < rtc_delay < chunk_size, got {self.rtc_delay}")
 
         if self.optimizer is None:
             self.optimizer = AdamWConfig(

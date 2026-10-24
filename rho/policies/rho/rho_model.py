@@ -30,6 +30,11 @@ from rho.utils import get_safe_dtype
 
 logger = logging.getLogger(__name__)
 
+# Share of train-time RTC training examples that get the full ``rtc_delay``; the rest train at delay 0.
+# Mirrors TARGET_DELAY_PROB in the pokeandwiggle monorepo's policies/training/src/policy_training/rtc.py
+# (this fork cannot import it); keep the two in sync.
+RTC_TARGET_DELAY_PROB = 0.25
+
 
 def get_sinusoidal_encoding(seq_len, embed_dim, device="cpu"):
     """Build sinusoidal positional encoding in fp32 for precision."""
@@ -158,7 +163,9 @@ class AdaptiveLayerNorm(nn.Module):
             x: Input tensor to normalize
             cond: Timestep embedding (shared=False), precomputed base
                 modulation (shared offset mode), or ``(base, timestep_emb)``
-                for shared low-rank adaptation.
+                for shared low-rank adaptation. Each is per-example, shape
+                (B, ...), or per-token, shape (S, B, ...) with S matching ``x``
+                (train-time RTC gives every action token its own flow time).
 
         Returns:
             Tuple of (normalized_modulated_x, gate)
@@ -176,9 +183,20 @@ class AdaptiveLayerNorm(nn.Module):
             modulation = self.modulation(cond)
         scale, shift, gate = modulation.chunk(3, dim=-1)
         # Apply scale and shift to normalized input
-        # Use unsqueeze(0) to broadcast over sequence dimension (seq, batch, embed)
-        x_mod = x_norm * (1 + scale.unsqueeze(0)) + shift.unsqueeze(0)
+        # Per-example (B, D) modulation broadcasts over the sequence dimension (seq, batch, embed);
+        # per-token (S, B, D) modulation already carries it.
+        x_mod = x_norm * (1 + broadcast_over_sequence(scale)) + broadcast_over_sequence(shift)
         return x_mod, gate
+
+
+def broadcast_over_sequence(modulation):
+    """Lift a per-example (B, D) modulation to (1, B, D); a per-token (S, B, D) one is returned as is."""
+    return modulation.unsqueeze(0) if modulation.ndim == 2 else modulation
+
+
+def kv_time(time_emb):
+    """The flow time that conditions the VLM key/value tokens: per-token time's first (state) token's."""
+    return time_emb if time_emb.ndim == 2 else time_emb[0]
 
 
 def build_shared_adaln_maps(embed_dim, roles):
@@ -195,7 +213,10 @@ def build_shared_adaln_maps(embed_dim, roles):
 def shared_adaln_cond(time_emb, role, mode):
     """Select a shared modulation, optionally paired with raw conditioning."""
     base = time_emb[role]
-    return (base, time_emb["_raw"]) if mode == "shared_lora" else base
+    if mode != "shared_lora":
+        return base
+    raw = time_emb["_raw"]
+    return (base, kv_time(raw) if role == "kv" else raw)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -339,12 +360,12 @@ class TransformerBlock(nn.Module):
             x_norm, gate_attn = self.pre_norm(x, cond_pre)
             attn_output, _ = self.self_attention(x_norm, x_norm, x_norm, key_padding_mask=key_padding_mask)
             # Gated residual: x = x + gate * attn_output
-            x = x + gate_attn.unsqueeze(0) * self.dropout(attn_output)
+            x = x + broadcast_over_sequence(gate_attn) * self.dropout(attn_output)
 
             x_norm, gate_ff = self.post_norm(x, cond_post)
             ff_out = self.feedforward(x_norm)
             # Gated residual: x = x + gate * ff_out
-            x = x + gate_ff.unsqueeze(0) * self.dropout(ff_out)
+            x = x + broadcast_over_sequence(gate_ff) * self.dropout(ff_out)
         else:
             # Standard residuals for non-adaptive norm
             x_norm = self.pre_norm(x)
@@ -436,25 +457,28 @@ class CrossAttentionTransformerBlock(nn.Module):
                     shared_adaln_cond(time_emb, r, self.adaln_mode) for r in ("q1", "q2", "kv", "q3")
                 )
             else:
-                cond_q1 = cond_q2 = cond_kv = cond_q3 = time_emb
+                cond_q1 = cond_q2 = cond_q3 = time_emb
+                cond_kv = kv_time(time_emb)
 
             # Query self-attention with gated residual
             q_norm, gate_self = self.q_norm_1(query_tokens, cond_q1)
             self_attn_output, _ = self.query_self_attention(
                 q_norm, q_norm, q_norm, key_padding_mask=query_mask
             )
-            query_tokens = query_tokens + gate_self.unsqueeze(0) * self.dropout(self_attn_output)
+            query_tokens = query_tokens + broadcast_over_sequence(gate_self) * self.dropout(self_attn_output)
 
             # Cross-attention with gated residual
             q_norm, gate_cross = self.q_norm_2(query_tokens, cond_q2)
             kv_norm, _ = self.kv_norm(key_value_tokens, cond_kv)  # gate unused for KV
             cross_attn_output, _ = self.cross_attention(q_norm, kv_norm, kv_norm, key_padding_mask=kv_mask)
-            query_tokens = query_tokens + gate_cross.unsqueeze(0) * self.dropout(cross_attn_output)
+            query_tokens = query_tokens + broadcast_over_sequence(gate_cross) * self.dropout(
+                cross_attn_output
+            )
 
             # Feedforward with gated residual
             q_norm, gate_ff = self.q_norm_3(query_tokens, cond_q3)
             ff_out = self.feedforward(q_norm)
-            query_tokens = query_tokens + gate_ff.unsqueeze(0) * self.dropout(ff_out)
+            query_tokens = query_tokens + broadcast_over_sequence(gate_ff) * self.dropout(ff_out)
         else:
             # Standard residuals for non-adaptive norm
             q_norm = self.q_norm_1(query_tokens)
@@ -543,12 +567,19 @@ class SimpleActionExpert(nn.Module):
         """
         image_text_embed: (batch_size, num_image_tokens, embed_dim)
         state_emb: (batch_size, num_state_tokens, embed_dim)
-        time_emb: (batch_size, num_time_tokens, embed_dim)
+        time_emb: (batch_size, embed_dim), or (batch_size, num_state_tokens, embed_dim)
+                  for per-token flow time (train-time RTC)
         image_text_attn_mask: (batch_size, num_image_tokens) or None - mask for image/text tokens
                               where 1 = valid token, 0 = padding/masked token
 
         Note: time_emb is being passed in for AdaptiveLayerNorm only
         """
+        if time_emb.ndim == 3:
+            # Per-token flow time over the state/action tokens; image/text tokens take the
+            # suffix time (the first state token's), then go sequence-major like x.
+            n_img = image_text_embed.size(1)
+            time_emb = torch.cat((time_emb[:, :1].expand(-1, n_img, -1), time_emb), dim=1).transpose(0, 1)
+
         # Stack along num_token dimension: (batch, total_tokens, embed_dim)
         x = torch.cat((image_text_embed, state_emb), dim=1)
         x = x.permute(1, 0, 2)  # (total_tokens, batch_size, embed_dim) for attention
@@ -584,7 +615,10 @@ class SimpleActionExpert(nn.Module):
         # gradient-checkpointed region, and pass them to every block.
         block_cond = time_emb
         if self.norm == "adaptive" and self.adaln_mode in ("shared", "shared_lora"):
-            block_cond = {role: mod(time_emb) for role, mod in self.shared_mod.items()}
+            block_cond = {
+                role: mod(kv_time(time_emb) if role == "kv" else time_emb)
+                for role, mod in self.shared_mod.items()
+            }
             if self.adaln_mode == "shared_lora":
                 block_cond["_raw"] = time_emb
 
@@ -671,10 +705,14 @@ class CrossAttentionActionExpert(nn.Module):
         """
         image_text_embed: (batch_size, num_image_tokens, embed_dim)
         state_emb: (batch_size, num_state_tokens, embed_dim)
-        time_emb: (batch_size, 1, embed_dim)
+        time_emb: (batch_size, embed_dim), or (batch_size, num_state_tokens, embed_dim)
+                  for per-token flow time (train-time RTC)
         image_text_attn_mask: (batch_size, num_image_tokens) or None - mask for image/text tokens
                               where 1 = valid token, 0 = padding/masked token
         """
+        if time_emb.ndim == 3:
+            time_emb = time_emb.transpose(0, 1)  # per-token flow time, sequence-major like the tokens
+
         # assuming image_emb, text_emb, state_emb are already in the shared embed_dim
 
         ### WORKING VERSION ###
@@ -703,7 +741,10 @@ class CrossAttentionActionExpert(nn.Module):
         # gradient-checkpointed region, and pass them to every block.
         block_cond = time_emb
         if self.norm == "adaptive" and self.adaln_mode in ("shared", "shared_lora"):
-            block_cond = {role: mod(time_emb) for role, mod in self.shared_mod.items()}
+            block_cond = {
+                role: mod(kv_time(time_emb) if role == "kv" else time_emb)
+                for role, mod in self.shared_mod.items()
+            }
             if self.adaln_mode == "shared_lora":
                 block_cond["_raw"] = time_emb
 
@@ -849,10 +890,14 @@ class LayerwiseCrossAttentionExpert(nn.Module):
             vlm_hidden_states: list of (B, S, vlm_hidden_dim) tensors,
                 one per VLM layer.
             state_emb: (B, num_state_tokens, embed_dim)
-            time_emb: (B, embed_dim)
+            time_emb: (B, embed_dim), or (B, num_state_tokens, embed_dim) for
+                per-token flow time (train-time RTC)
             image_text_attn_mask: (B, S) or None
                 where 1 = valid, 0 = padding
         """
+        if time_emb.ndim == 3:
+            time_emb = time_emb.transpose(0, 1)  # per-token flow time, sequence-major like the tokens
+
         selected = self._select_vlm_layers(vlm_hidden_states)
 
         state_tokens = state_emb.permute(1, 0, 2)
@@ -874,7 +919,10 @@ class LayerwiseCrossAttentionExpert(nn.Module):
         # gradient-checkpointed region, and pass them to every block.
         block_cond = time_emb
         if self.norm == "adaptive" and self.adaln_mode in ("shared", "shared_lora"):
-            block_cond = {role: mod(time_emb) for role, mod in self.shared_mod.items()}
+            block_cond = {
+                role: mod(kv_time(time_emb) if role == "kv" else time_emb)
+                for role, mod in self.shared_mod.items()
+            }
             if self.adaln_mode == "shared_lora":
                 block_cond["_raw"] = time_emb
 
@@ -1622,7 +1670,11 @@ class FlowMatchingModel(BaseVLMModel):
         return pos_emb.to(dtype=self.dtype)
 
     def embed_state(self, state, noisy_actions, timestep):  # based on embed_suffix() in modeling_pi0.py
-        """Embed state, noisy_actions, timestep to prepare for further processing."""
+        """Embed state, noisy_actions, timestep to prepare for further processing.
+
+        ``timestep`` is per-example, shape (B,), or per-action-token, shape (B, chunk_size)
+        (train-time RTC, where the prefix tokens sit at t=0).
+        """
         embs = []
 
         # Store as bf16 for memory; linears will run under autocast bf16
@@ -1638,13 +1690,20 @@ class FlowMatchingModel(BaseVLMModel):
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = self.create_sinusoidal_pos_embedding(
-            timestep.to(self.device), self.embed_dim, min_period=4e-3, max_period=4.0, device=device
+            timestep.to(self.device).reshape(-1),
+            self.embed_dim,
+            min_period=4e-3,
+            max_period=4.0,
+            device=device,
         )
         time_emb = time_emb.type(dtype=dtype)
 
         # Fuse timestep + action information using an MLP
         action_emb = self.action_in_proj(noisy_actions)
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        if timestep.ndim == 1:
+            time_emb = time_emb[:, None, :].expand_as(action_emb)
+        else:
+            time_emb = time_emb.reshape(action_emb.shape)
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
         action_time_emb = self.action_time_mlp_in(action_time_emb)
@@ -1658,10 +1717,15 @@ class FlowMatchingModel(BaseVLMModel):
         return embs
 
     def embed_time_for_cond(self, timestep):
+        """AdaLN conditioning: ``timestep`` (B,) gives (B, D); per-token (B, S) gives (B, S, D)."""
         timestep = timestep.to(device=self.device, dtype=self.dtype)
 
         time_emb = self.create_sinusoidal_pos_embedding(
-            timestep.to(self.device), self.embed_dim, min_period=4e-3, max_period=4.0, device=timestep.device
+            timestep.to(self.device).reshape(-1),
+            self.embed_dim,
+            min_period=4e-3,
+            max_period=4.0,
+            device=timestep.device,
         )
 
         time_emb = self.time_mlp_in(time_emb)
@@ -1669,7 +1733,29 @@ class FlowMatchingModel(BaseVLMModel):
         time_emb = self.time_mlp_out(time_emb)
         time_emb = F.silu(time_emb)
         time_emb = time_emb.type(dtype=self.dtype)
-        return time_emb
+        return time_emb.reshape(*timestep.shape, -1)
+
+    def _embed_rtc_suffix(self, state, x_t, suffix_time, prefix_mask):
+        """Suffix embeddings with train-time RTC's per-token flow time.
+
+        Args:
+            suffix_time: (B,) flow time of the noisy actions, which the state tokens share.
+            prefix_mask: (B, chunk_size) bool, True for the clean prefix tokens held at t=0.
+
+        Returns:
+            ``(state_embed, time_emb)``, the latter (B, num_state_tokens + chunk_size, D).
+        """
+        suffix_time = suffix_time.to(device=self.device, dtype=self.dtype)
+        action_time = torch.where(prefix_mask, torch.zeros_like(suffix_time[:, None]), suffix_time[:, None])
+        state_embed = self.embed_state(state, x_t, action_time)
+        num_state_tokens = state_embed.shape[1] - self.config.chunk_size
+        token_time = torch.cat((suffix_time[:, None].expand(-1, num_state_tokens), action_time), dim=1)
+        return state_embed, self.embed_time_for_cond(token_time)
+
+    def _draw_rtc_delay(self, batch_size, device):
+        """One delay per example: 0 or ``rtc_delay``, the mix of policy_training's rtc.py ``delay_probs``."""
+        delay = torch.full((batch_size,), self.config.rtc_delay, dtype=torch.long, device=device)
+        return torch.where(torch.rand(batch_size, device=device) < RTC_TARGET_DELAY_PROB, delay, 0)
 
     @staticmethod
     def _expand_batch_for_flow_samples(value, num_flow_samples):
@@ -1721,6 +1807,7 @@ class FlowMatchingModel(BaseVLMModel):
         image_mask=None,
         training_mode=None,
         precomputed_hidden_state=None,
+        rtc_delay=None,
     ):
         """
         Training forward pass with flow matching.
@@ -1735,10 +1822,16 @@ class FlowMatchingModel(BaseVLMModel):
             image_mask: Optional image masking
             training_mode: Training mode (ignored, always uses flow matching)
             precomputed_hidden_state: Optional tuple of (hidden_state, mask) to avoid recomputing
+            rtc_delay: Optional (B,) integer delays, one per example, overriding the draw. Only valid
+                when ``config.rtc_delay`` is set (train-time RTC).
 
         Returns:
-            losses: Per-element flow matching losses
+            losses: Per-element flow matching losses. With train-time RTC the first ``delay`` steps
+                of each example are zeroed and the rest rescaled by H / (H - delay), so the caller's
+                plain mean (after its own padding masks) is the paper's postfix-normalized mean.
         """
+        if self.config.rtc_delay is None and rtc_delay is not None:
+            raise ValueError("rtc_delay override requires the model to be configured with rtc_delay")
         # Store inputs in bf16 for memory
         actions = actions.to(dtype=self.dtype)
 
@@ -1794,6 +1887,25 @@ class FlowMatchingModel(BaseVLMModel):
             u_t32 = u_t32.reshape(batch_size * num_flow_samples, *actions.shape[1:])
             time = time_grouped.reshape(batch_size * num_flow_samples)
 
+        prefix_mask = None
+        if self.config.rtc_delay is not None:
+            # Train-time RTC (arXiv 2512.05964): the first `delay` actions of each example are a clean
+            # prefix at t=0 (clean in this reversed convention), so x_t holds the ground truth there.
+            # One delay per example, shared by its K flow samples; t and noise stay per sample.
+            if rtc_delay is None:
+                rtc_delay = self._draw_rtc_delay(batch_size, actions.device)
+            rtc_delay = rtc_delay.to(actions.device)
+            chunk_size = actions.shape[1]
+            prefix_mask = (
+                torch.arange(chunk_size, device=actions.device)[None, :]
+                < self._expand_batch_for_flow_samples(rtc_delay, num_flow_samples)[:, None]
+            )
+            x_t32 = torch.where(
+                prefix_mask[..., None],
+                self._expand_batch_for_flow_samples(actions, num_flow_samples).float(),
+                x_t32,
+            )
+
         # Cast x_t/time back for downstream bf16 modules
         x_t = x_t32.to(self.dtype)
 
@@ -1820,9 +1932,11 @@ class FlowMatchingModel(BaseVLMModel):
             image_text_mask = self._expand_batch_for_flow_samples(image_text_mask, num_flow_samples)
             state = self._expand_batch_for_flow_samples(state, num_flow_samples)
 
-        state_embed = self.embed_state(state, x_t, time)
-
-        time_embed = self.embed_time_for_cond(time)
+        if prefix_mask is None:
+            state_embed = self.embed_state(state, x_t, time)
+            time_embed = self.embed_time_for_cond(time)
+        else:
+            state_embed, time_embed = self._embed_rtc_suffix(state, x_t, time, prefix_mask)
 
         # Forward through action expert
         output_embed = self.action_expert.forward(
@@ -1838,6 +1952,12 @@ class FlowMatchingModel(BaseVLMModel):
         if num_flow_samples > 1:
             losses = losses.reshape(batch_size, num_flow_samples, *losses.shape[1:]).mean(dim=1)
 
+        if rtc_delay is not None:
+            # Supervise the postfix only; the delay is per example, so the K-mean above is unaffected.
+            postfix = (torch.arange(chunk_size, device=losses.device)[None, :] >= rtc_delay[:, None]).float()
+            rescale = chunk_size / (chunk_size - rtc_delay.float())
+            losses = losses * (postfix * rescale[:, None])[..., None]
+
         return losses
 
     def sample_actions(
@@ -1849,6 +1969,7 @@ class FlowMatchingModel(BaseVLMModel):
         image_mask=None,
         precomputed_hidden_state=None,
         num_steps=None,
+        prefix=None,
     ) -> Tensor:
         """
         Inference: denoise from t=1 to t=0 to generate actions.
@@ -1865,12 +1986,33 @@ class FlowMatchingModel(BaseVLMModel):
                 same conditioning.
             num_steps: Override the denoising step count. None = use the
                 configured ``self.config.num_steps``.
+            prefix: Optional (B, d, max_action_dim) normalized actions already committed, with ``d``
+                equal to ``config.rtc_delay`` (train-time RTC). They are pinned at t=0 in the first
+                ``d`` positions on every denoise step and come back verbatim. No guidance.
 
         Returns:
             Final denoised actions
         """
         bsize = state.shape[0]
         device = state.device
+
+        if prefix is not None:
+            if self.config.rtc_delay is None:
+                raise ValueError("prefix requires the model to be configured with rtc_delay")
+            if prefix.ndim != 3 or prefix.shape[0] != bsize or prefix.shape[1] != self.config.rtc_delay:
+                raise ValueError(
+                    f"prefix must have shape (batch={bsize}, rtc_delay={self.config.rtc_delay}, action_dim), "
+                    f"got {tuple(prefix.shape)}"
+                )
+            if prefix.shape[2] != self.config.max_action_dim:
+                raise ValueError(
+                    f"prefix action_dim must be max_action_dim={self.config.max_action_dim}, "
+                    f"got {prefix.shape[2]}"
+                )
+            prefix = prefix.to(device=device, dtype=self.dtype)
+            prefix_mask = (torch.arange(self.config.chunk_size, device=device) < prefix.shape[1])[
+                None
+            ].expand(bsize, -1)
 
         actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
         if noise is None and self.noise_policy is not None:
@@ -1911,12 +2053,21 @@ class FlowMatchingModel(BaseVLMModel):
                 image, prompt, image_mask=image_mask
             )
 
+        def pin_prefix(x):
+            return x if prefix is None else torch.cat((prefix, x[:, prefix.shape[1] :]), dim=1)
+
+        x_t = pin_prefix(x_t)
+
         # Denoise from t=1 to t=0
         while time32 >= -dt32 / 2:
             expanded_time_bf16 = time32.expand(bsize).to(self.dtype)
-            state_embed = self.embed_state(state, x_t.to(self.device), expanded_time_bf16)
-
-            time_emb = self.embed_time_for_cond(expanded_time_bf16)
+            if prefix is None:
+                state_embed = self.embed_state(state, x_t.to(self.device), expanded_time_bf16)
+                time_emb = self.embed_time_for_cond(expanded_time_bf16)
+            else:
+                state_embed, time_emb = self._embed_rtc_suffix(
+                    state, x_t.to(self.device), expanded_time_bf16, prefix_mask
+                )
 
             output_embed = self.action_expert.forward(
                 image_text_embed, state_embed, time_emb, image_text_attn_mask=image_text_mask
@@ -1926,7 +2077,7 @@ class FlowMatchingModel(BaseVLMModel):
 
             # Euler step in fp32
             x_t32 = x_t.float() + dt32 * v_t.float()
-            x_t = x_t32.to(self.dtype)
+            x_t = pin_prefix(x_t32.to(self.dtype))
             time32 = time32 + dt32
 
         return x_t  # Final denoised actions (bf16)
@@ -2238,11 +2389,13 @@ class RhoModel(nn.Module):
         super().__init__()
         self.flow_model = FlowMatchingModel(config)
 
-    def forward(self, image, prompt, state, actions, noise=None, time=None, image_mask=None):
-        return self.flow_model(image, prompt, state, actions, noise=noise, time=time, image_mask=image_mask)
+    def forward(self, image, prompt, state, actions, noise=None, time=None, image_mask=None, rtc_delay=None):
+        return self.flow_model(
+            image, prompt, state, actions, noise=noise, time=time, image_mask=image_mask, rtc_delay=rtc_delay
+        )
 
-    def sample_actions(self, image, prompt, state, noise=None, image_mask=None) -> Tensor:
-        return self.flow_model.sample_actions(image, prompt, state, noise, image_mask)
+    def sample_actions(self, image, prompt, state, noise=None, image_mask=None, prefix=None) -> Tensor:
+        return self.flow_model.sample_actions(image, prompt, state, noise, image_mask, prefix=prefix)
 
     def sample_actions_rtc(
         self,
